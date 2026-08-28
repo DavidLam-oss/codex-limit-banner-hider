@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
   const MARKER = "data-codex-limit-banner-hider";
   const STYLE_ID = "codex-limit-banner-hider-style";
   const STATUS_KEY = "__codexLimitBannerHiderStatus";

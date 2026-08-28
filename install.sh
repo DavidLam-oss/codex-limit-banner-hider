@@ -47,9 +47,12 @@ state.pop("managedPID", None)
 state.pop("managedStartedAt", None)
 state.pop("managedProcessStartedAt", None)
 state.pop("skipStartedAt", None)
+state.pop("skipSignatureValid", None)
+state.pop("skipLastError", None)
 if pid:
     state["skipPID"] = int(pid)
     state["skipDecision"] = "current-process-preserved"
+    state["skipSignatureValid"] = True
 else:
     state.pop("skipPID", None)
     state.pop("skipDecision", None)
@@ -87,7 +90,25 @@ PY
 /bin/chmod 600 "$LAUNCH_AGENT"
 
 /bin/launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
-/bin/launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT"
+for _ in {1..50}; do
+    if ! /bin/launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+        break
+    fi
+    /bin/sleep 0.1
+done
+
+bootstrapped=false
+for _ in {1..25}; do
+    if /bin/launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT" >/dev/null 2>&1; then
+        bootstrapped=true
+        break
+    fi
+    /bin/sleep 0.2
+done
+if [[ "$bootstrapped" != true ]]; then
+    print -u2 "Could not load $LABEL after waiting for the previous controller to exit."
+    /bin/launchctl bootstrap "gui/$UID" "$LAUNCH_AGENT"
+fi
 /bin/launchctl enable "gui/$UID/$LABEL"
 /bin/launchctl kickstart -k "gui/$UID/$LABEL"
 

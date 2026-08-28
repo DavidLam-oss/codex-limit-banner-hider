@@ -9,7 +9,7 @@ private let executablePath = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 private let bundleID = "com.openai.codex"
 private let teamID = "2DC432GLL2"
 private let supportPath = NSString(string: "~/Library/Application Support/Codex Limit Banner Hider").expandingTildeInPath
-private let isSelfTestInvocation = CommandLine.arguments.dropFirst().first == "self-test-pipe"
+private let isSelfTestInvocation = CommandLine.arguments.dropFirst().first?.hasPrefix("self-test-") == true
 private let stateDirectory = isSelfTestInvocation
     ? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limit-banner-hider-state.\(getpid())").path
     : supportPath + "/state"
@@ -17,7 +17,7 @@ private let statusPath = stateDirectory + "/status.json"
 private let runtimePath = stateDirectory + "/runtime.json"
 private let injectionPath = supportPath + "/install/share/injected.js"
 private let managedFlag = "--codex-limit-banner-hider-managed"
-private let controllerVersion = "1.1.0"
+private let controllerVersion = "1.1.1"
 private let freshLaunchAge: TimeInterval = 15
 private let pendingLaunchLifetime: TimeInterval = 90
 
@@ -108,9 +108,21 @@ private func validateApplication() -> (Bool, String) {
     let requirement = "identifier \"\(bundleID)\" and anchor apple generic and certificate leaf[subject.OU] = \"\(teamID)\""
     let verification = shell("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(requirement)", appPath])
     if verification.0 != 0 { return (false, "OpenAI signature verification failed") }
-    let plist = shell("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleIdentifier", appPath + "/Contents/Info.plist"])
-    if plist.0 != 0 || plist.1.trimmingCharacters(in: .whitespacesAndNewlines) != bundleID {
-        return (false, "Bundle identifier mismatch")
+
+    // Read Info.plist in-process. Launching PlistBuddy from the background
+    // controller produced repeatable false mismatches even though codesign and
+    // a direct plist read both reported the expected identifier.
+    do {
+        let plistData = try Data(contentsOf: URL(fileURLWithPath: appPath + "/Contents/Info.plist"))
+        guard let plist = try PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
+              let observedBundleID = plist["CFBundleIdentifier"] as? String else {
+            return (false, "Bundle identifier could not be read")
+        }
+        guard observedBundleID == bundleID else {
+            return (false, "Bundle identifier mismatch: expected \(bundleID), found \(observedBundleID)")
+        }
+    } catch {
+        return (false, "Bundle identifier read failed: \(error.localizedDescription)")
     }
     return (true, "ok")
 }
@@ -295,6 +307,8 @@ private func preserveOrdinaryApplication(reason: String) {
     runtime.removeValue(forKey: "managedProcessStartedAt")
     runtime["skipPID"] = Int(pid)
     runtime["skipDecision"] = "ordinary-codex-restored"
+    runtime["skipSignatureValid"] = true
+    runtime["skipLastError"] = reason
     writeJSON(runtime, to: runtimePath)
     updateStatus(["mode": "deferred", "codexPID": Int(pid), "decision": "ordinary-codex-restored", "lastError": reason])
 }
@@ -374,6 +388,8 @@ private func superviseManagedApplication(_ app: SpawnedApplication, sourcePath: 
         runtime.removeValue(forKey: "managedProcessStartedAt")
         runtime["skipPID"] = Int(app.pid)
         runtime["skipDecision"] = "injection-file-missing-process-preserved"
+        runtime["skipSignatureValid"] = true
+        runtime["skipLastError"] = String(describing: error)
         writeJSON(runtime, to: runtimePath)
         updateStatus(["mode": "deferred", "codexPID": Int(app.pid), "decision": "injection-file-missing-process-preserved", "lastError": String(describing: error)])
         if terminateAfterTest { kill(app.pid, SIGTERM) }
@@ -443,12 +459,20 @@ private func clearPreservedProcess(_ runtime: inout [String: Any]) {
     runtime.removeValue(forKey: "skipPID")
     runtime.removeValue(forKey: "skipStartedAt")
     runtime.removeValue(forKey: "skipDecision")
+    runtime.removeValue(forKey: "skipSignatureValid")
+    runtime.removeValue(forKey: "skipLastError")
 }
 
-private func preserve(_ process: AppProcess, decision: String, runtime: inout [String: Any]) {
+private func preserve(_ process: AppProcess, decision: String, signatureValid: Bool = true, lastError: String? = nil, runtime: inout [String: Any]) {
     runtime["skipPID"] = Int(process.pid)
     runtime["skipStartedAt"] = process.startedAt
     runtime["skipDecision"] = decision
+    runtime["skipSignatureValid"] = signatureValid
+    if let lastError {
+        runtime["skipLastError"] = lastError
+    } else {
+        runtime.removeValue(forKey: "skipLastError")
+    }
     writeJSON(runtime, to: runtimePath)
 }
 
@@ -478,6 +502,7 @@ private func supervise() {
         } else if let preserved, runtime["skipStartedAt"] == nil {
             runtime["skipStartedAt"] = preserved.startedAt
             runtime["skipDecision"] = runtime["skipDecision"] ?? "current-process-preserved"
+            runtime["skipSignatureValid"] = runtime["skipSignatureValid"] ?? true
             writeJSON(runtime, to: runtimePath)
         }
 
@@ -487,12 +512,14 @@ private func supervise() {
                 firstSeenFreshProcess[process.identity] != nil &&
                 !commandIsExternallyControlled(commandByIdentity[process.identity] ?? process.command)
             }
+            let preservedLastError: Any = (runtime["skipLastError"] as? String).map { $0 as Any } ?? NSNull()
             updateStatus([
                 "mode": "deferred",
                 "codexPID": Int(preserved.pid),
                 "decision": runtime["skipDecision"] as? String ?? "current-process-preserved",
                 "pendingCandidatePID": pending.map { Int($0.pid) } as Any? ?? NSNull(),
-                "signatureValid": true,
+                "signatureValid": runtime["skipSignatureValid"] as? Bool ?? true,
+                "lastError": preservedLastError,
             ])
             sleep(1)
             continue
@@ -537,7 +564,7 @@ private func supervise() {
         updateStatus(["mode": "handoff", "codexPID": Int(candidate.pid), "decision": "verifying-new-process", "signatureValid": NSNull()])
         let validation = validateApplication()
         guard validation.0 else {
-            preserve(candidate, decision: "application-rejected-process-preserved", runtime: &runtime)
+            preserve(candidate, decision: "application-rejected-process-preserved", signatureValid: false, lastError: validation.1, runtime: &runtime)
             updateStatus(["mode": "deferred", "codexPID": Int(candidate.pid), "decision": "application-rejected-process-preserved", "signatureValid": false, "lastError": validation.1])
             continue
         }
@@ -589,6 +616,12 @@ case "self-test-processes":
     let processes = findApplicationProcesses().map { ["pid": Int($0.pid), "ageSeconds": $0.age, "command": $0.command] as [String: Any] }
     let data = try! JSONSerialization.data(withJSONObject: processes, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
+case "self-test-application-validation":
+    let validation = validateApplication()
+    let result: [String: Any] = ["valid": validation.0, "message": validation.1]
+    let data = try! JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    if !validation.0 { exit(1) }
 case "self-test-pipe":
     let testProfile = FileManager.default.temporaryDirectory.appendingPathComponent("codex-limit-banner-hider-test.\(UUID().uuidString)").path
     try? FileManager.default.createDirectory(atPath: testProfile, withIntermediateDirectories: true)
@@ -601,6 +634,6 @@ case "self-test-pipe":
     printStatus(json: true)
 case "status": printStatus(json: arguments.contains("--json"))
 default:
-    fputs("Usage: codex-limit-banner-hider-controller [supervise|status [--json]]\n", stderr)
+    fputs("Usage: codex-limit-banner-hider-controller [supervise|status [--json]|self-test-application-validation]\n", stderr)
     exit(64)
 }
