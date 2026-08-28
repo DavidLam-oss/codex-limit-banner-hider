@@ -142,12 +142,146 @@ try {
     })()`;
     const evaluated = await command("Runtime.evaluate", { expression, returnByValue: true }, sessionId);
     const actual = evaluated.result.result.value;
+    const expectedVisible = (test.html.match(/<aside\b/gu) ?? []).length - test.hidden;
     const pass = actual.status.decision === test.decision &&
       actual.status.hiddenCount === test.hidden &&
       actual.marked === test.hidden &&
+      actual.visible === expectedVisible &&
       actual.clicks === 0;
-    results.push({ name: test.name, pass, expected: { decision: test.decision, hidden: test.hidden }, actual });
+    results.push({ name: test.name, pass, expected: { decision: test.decision, hidden: test.hidden, visible: expectedVisible }, actual });
   }
+
+  const performanceExpression = `(async () => {
+    const root = document.querySelector('#root');
+    const instance = globalThis.__codexLimitBannerHiderInstance;
+    const resetMetrics = () => {
+      for (const key of Object.keys(instance.metrics)) instance.metrics[key] = 0;
+    };
+    const yieldTask = () => new Promise(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        channel.port2.close();
+        resolve();
+      };
+      channel.port2.postMessage(null);
+    });
+
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < 10000; index += 1) {
+      const element = document.createElement('div');
+      element.textContent = 'node-' + index;
+      fragment.append(element);
+    }
+    root.replaceChildren(fragment);
+    const sidebar = document.createElement('aside');
+    sidebar.className = 'sidebar-live';
+    const sidebarText = document.createElement('span');
+    sidebarText.append('sidebar');
+    sidebar.append(sidebarText);
+    root.append(sidebar);
+    const streamContainer = root.firstChild;
+    const streamTarget = streamContainer.firstChild;
+    instance.scan();
+    resetMetrics();
+    const characterDataStartedAt = performance.now();
+    for (let index = 0; index < 60; index += 1) {
+      streamTarget.data = 'stream-' + index;
+      await yieldTask();
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const characterDataStream = {
+      elapsedMs: performance.now() - characterDataStartedAt,
+      ...instance.metrics,
+    };
+
+    resetMetrics();
+    const sidebarStartedAt = performance.now();
+    for (let index = 0; index < 60; index += 1) {
+      sidebarText.firstChild.data = 'sidebar-' + index;
+      await yieldTask();
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const sidebarStream = {
+      elapsedMs: performance.now() - sidebarStartedAt,
+      ...instance.metrics,
+    };
+
+    resetMetrics();
+    const childListStartedAt = performance.now();
+    for (let index = 0; index < 60; index += 1) {
+      const span = document.createElement('span');
+      span.textContent = 'chunk-' + index;
+      streamContainer.append(span);
+      await yieldTask();
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const childListStream = {
+      elapsedMs: performance.now() - childListStartedAt,
+      ...instance.metrics,
+    };
+    const irrelevantStream = { characterDataStream, sidebarStream, childListStream };
+
+    root.innerHTML = ${JSON.stringify(banner())};
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const discovery = {
+      status: globalThis.__codexLimitBannerHiderStatus,
+      hidden: root.querySelectorAll('aside[data-codex-limit-banner-hider=hidden]').length,
+    };
+    const messageTarget = root.querySelector('h3 span:last-child').firstChild;
+    resetMetrics();
+    const relevantStartedAt = performance.now();
+    for (let index = 0; index < 60; index += 1) {
+      messageTarget.data = 'Upgrade for more now, or wait for usage to reset on day-' + index + '.';
+      await yieldTask();
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const relevantStream = {
+      elapsedMs: performance.now() - relevantStartedAt,
+      ...instance.metrics,
+      status: globalThis.__codexLimitBannerHiderStatus,
+      hidden: root.querySelectorAll('aside[data-codex-limit-banner-hider=hidden]').length,
+    };
+    return { irrelevantStream, discovery, relevantStream };
+  })()`;
+  const performanceEvaluated = await command("Runtime.evaluate", {
+    expression: performanceExpression,
+    awaitPromise: true,
+    returnByValue: true,
+  }, sessionId);
+  const performanceActual = performanceEvaluated.result.result.value;
+  results.push({
+    name: "unrelated streaming mutations do not reconcile",
+    pass: performanceActual.irrelevantStream.characterDataStream.observerCallbackCount === 0 &&
+      performanceActual.irrelevantStream.characterDataStream.reconcileCount === 0 &&
+      performanceActual.irrelevantStream.childListStream.observerCallbackCount === 0 &&
+      performanceActual.irrelevantStream.childListStream.asideCallbackCount === 0 &&
+      performanceActual.irrelevantStream.childListStream.relevantMutationBatchCount === 0 &&
+      performanceActual.irrelevantStream.childListStream.reconcileCount === 0,
+    expected: { characterDataObserverCallbacks: 0, childListObserverCallbacks: 0, relevantMutationBatchCount: 0, reconcileCount: 0 },
+    actual: performanceActual.irrelevantStream,
+  });
+  results.push({
+    name: "live sidebar aside mutations do not reconcile",
+    pass: performanceActual.irrelevantStream.sidebarStream.observerCallbackCount === 0 &&
+      performanceActual.irrelevantStream.sidebarStream.asideCallbackCount === 0 &&
+      performanceActual.irrelevantStream.sidebarStream.relevantMutationBatchCount === 0 &&
+      performanceActual.irrelevantStream.sidebarStream.reconcileCount === 0,
+    expected: { sidebarObserverCallbacks: 0, sidebarRelevantBatches: 0, sidebarReconciles: 0 },
+    actual: performanceActual.irrelevantStream.sidebarStream,
+  });
+  results.push({
+    name: "new banner is discovered and relevant mutations are coalesced",
+    pass: performanceActual.discovery.status.decision === "hidden" &&
+      performanceActual.discovery.hidden === 1 &&
+      performanceActual.relevantStream.observerCallbackCount > 0 &&
+      performanceActual.relevantStream.relevantMutationBatchCount > 0 &&
+      performanceActual.relevantStream.reconcileCount <= 2 &&
+      performanceActual.relevantStream.status.decision === "hidden" &&
+      performanceActual.relevantStream.hidden === 1,
+    expected: { discoveredDecision: "hidden", maximumReconcileCount: 2, decision: "hidden", hidden: 1 },
+    actual: { discovery: performanceActual.discovery, relevantStream: performanceActual.relevantStream },
+  });
   output = { ok: results.every(result => result.pass), results };
 } catch (error) {
   output = { ok: false, error: String(error) };
@@ -160,7 +294,11 @@ try {
       resolve();
     });
   });
-  await rm(profile, { recursive: true, force: true });
+  try {
+    await rm(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+  } catch (error) {
+    console.error(`warning: could not remove disposable profile: ${error}`);
+  }
 }
 
 console.log(JSON.stringify(output, null, 2));

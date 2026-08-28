@@ -1,14 +1,12 @@
 import Foundation
 import Darwin
 
-@_silgen_name("_NSGetEnviron")
-private func NSGetEnviron() -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
-
 private let appPath = "/Applications/ChatGPT.app"
 private let executablePath = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 private let bundleID = "com.openai.codex"
 private let teamID = "2DC432GLL2"
 private let supportPath = NSString(string: "~/Library/Application Support/Codex Limit Banner Hider").expandingTildeInPath
+private let codexProfileDirectory = NSString(string: "~/Library/Application Support/Codex").expandingTildeInPath
 private let isSelfTestInvocation = CommandLine.arguments.dropFirst().first?.hasPrefix("self-test-") == true
 private let stateDirectory = isSelfTestInvocation
     ? FileManager.default.temporaryDirectory.appendingPathComponent("codex-limit-banner-hider-state.\(getpid())").path
@@ -17,7 +15,7 @@ private let statusPath = stateDirectory + "/status.json"
 private let runtimePath = stateDirectory + "/runtime.json"
 private let injectionPath = supportPath + "/install/share/injected.js"
 private let managedFlag = "--codex-limit-banner-hider-managed"
-private let controllerVersion = "1.1.1"
+private let controllerVersion = "1.3.0"
 private let freshLaunchAge: TimeInterval = 15
 private let pendingLaunchLifetime: TimeInterval = 90
 
@@ -176,48 +174,70 @@ private func findApplicationProcesses() -> [AppProcess] {
 }
 
 private func readCommandLine(pid: pid_t) -> String? {
-    let result = shell("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="])
-    guard result.0 == 0 else { return nil }
-    let command = result.1.trimmingCharacters(in: .whitespacesAndNewlines)
-    return command.isEmpty ? nil : command
+    // Read argv natively via KERN_PROCARGS2 instead of forking /bin/ps once
+    // per candidate per polling cycle.
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    if sysctl(&mib, 3, nil, &size, nil, 0) != 0 { return nil }
+    guard size > MemoryLayout<Int32>.size else { return nil }
+    var buffer = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+    var argc: Int32 = 0
+    memcpy(&argc, buffer, MemoryLayout<Int32>.size)
+    guard argc > 0 else { return nil }
+    var index = MemoryLayout<Int32>.size
+    while index < size && buffer[index] != 0 { index += 1 } // executable path
+    var arguments: [String] = []
+    while index < size && arguments.count < Int(argc) {
+        while index < size && buffer[index] == 0 { index += 1 }
+        let start = index
+        while index < size && buffer[index] != 0 { index += 1 }
+        if index > start { arguments.append(String(bytes: buffer[start..<index], encoding: .utf8) ?? "") }
+    }
+    guard !arguments.isEmpty else { return nil }
+    return arguments.joined(separator: " ")
 }
 
 private func isAlive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
 
+// CDP over a localhost WebSocket. The managed app is launched through Launch
+// Services with --remote-debugging-port=0, so Chromium picks a random port and
+// records it plus the browser-level WebSocket path in <profile>/DevToolsActivePort.
 private final class CDPClient {
-    private let input: FileHandle
-    private let output: FileHandle
     private let lock = NSLock()
-    private var buffer = Data()
     private var nextID = 1
     private var pending: [Int: ([String: Any]) -> Void] = [:]
+    private let session: URLSession
+    private let task: URLSessionWebSocketTask
 
-    init(inputFD: Int32, outputFD: Int32) {
-        input = FileHandle(fileDescriptor: inputFD, closeOnDealloc: true)
-        output = FileHandle(fileDescriptor: outputFD, closeOnDealloc: true)
-        output.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if !data.isEmpty { self?.consume(data) }
+    init(url: URL) {
+        session = URLSession(configuration: .ephemeral)
+        task = session.webSocketTask(with: url)
+        task.resume()
+        receiveNext()
+    }
+
+    private func receiveNext() {
+        task.receive { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message { self.consume(text) }
+                self.receiveNext()
+            case .failure:
+                break // connection closed; outstanding commands hit their timeout
+            }
         }
     }
 
-    deinit { output.readabilityHandler = nil }
-
-    private func consume(_ data: Data) {
+    private func consume(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = message["id"] as? Int else { return }
         lock.lock()
-        buffer.append(data)
-        while let end = buffer.firstIndex(of: 0) {
-            let packet = buffer[..<end]
-            buffer.removeSubrange(...end)
-            guard !packet.isEmpty,
-                  let message = try? JSONSerialization.jsonObject(with: Data(packet)) as? [String: Any],
-                  let id = message["id"] as? Int,
-                  let callback = pending.removeValue(forKey: id) else { continue }
-            lock.unlock()
-            callback(message)
-            lock.lock()
-        }
+        let callback = pending.removeValue(forKey: id)
         lock.unlock()
+        callback?(message)
     }
 
     func command(_ method: String, params: [String: Any] = [:], sessionID: String? = nil, timeout: TimeInterval = 8) -> [String: Any]? {
@@ -231,70 +251,133 @@ private final class CDPClient {
 
         var message: [String: Any] = ["id": id, "method": method, "params": params]
         if let sessionID { message["sessionId"] = sessionID }
-        guard var data = try? JSONSerialization.data(withJSONObject: message) else { return nil }
-        data.append(0)
-        do { try input.write(contentsOf: data) } catch { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: message),
+              let text = String(data: data, encoding: .utf8) else {
+            lock.lock(); pending.removeValue(forKey: id); lock.unlock()
+            return nil
+        }
+        task.send(.string(text)) { _ in }
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             lock.lock(); pending.removeValue(forKey: id); lock.unlock()
             return nil
         }
         return response
     }
+
+    func close() { task.cancel(with: .goingAway, reason: nil) }
+    deinit { close() }
 }
 
-private struct SpawnedApplication { let pid: pid_t; let cdp: CDPClient }
+private struct ManagedApplication { let pid: pid_t; let cdp: CDPClient }
 
-private func spawnManagedApplication(extraArguments: [String] = []) -> SpawnedApplication? {
-    var toChild: [Int32] = [0, 0]
-    var fromChild: [Int32] = [0, 0]
-    guard pipe(&toChild) == 0 else { return nil }
-    guard pipe(&fromChild) == 0 else {
-        close(toChild[0]); close(toChild[1])
-        return nil
-    }
+// `open --args` does not deliver command-line arguments to ChatGPT.app on this
+// macOS (activation-style launching swallows them), but Launch Services still
+// gives the app its normal foreground context — which direct posix_spawn
+// lacks and which showed up as input lag. The shim bridges the gap: a tiny
+// locally generated .app bundle is launched through Launch Services, and its
+// launcher execs the real (signature-verified) Codex binary with the
+// debugging flags baked in. The exec keeps the LS-launched process context
+// while restoring full argv.
+private func shimBundlePath() -> String { supportPath + "/install/shim/CodexDebugShim.app" }
 
-    var actions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&actions)
-    posix_spawn_file_actions_addclose(&actions, toChild[1])
-    posix_spawn_file_actions_addclose(&actions, fromChild[0])
-    posix_spawn_file_actions_adddup2(&actions, toChild[0], 3)
-    posix_spawn_file_actions_adddup2(&actions, fromChild[1], 4)
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
-    if toChild[0] != 3 && toChild[0] != 4 { posix_spawn_file_actions_addclose(&actions, toChild[0]) }
-    if fromChild[1] != 3 && fromChild[1] != 4 { posix_spawn_file_actions_addclose(&actions, fromChild[1]) }
-
-    let args = [executablePath, "--remote-debugging-pipe", managedFlag] + extraArguments
-    let argv = args.map { strdup($0) } + [nil]
-    defer { argv.forEach { if let pointer = $0 { free(pointer) } } }
-    var pid: pid_t = 0
-    guard let environment = NSGetEnviron().pointee else { return nil }
-    let result = posix_spawn(&pid, executablePath, &actions, nil, argv, environment)
-    posix_spawn_file_actions_destroy(&actions)
-    close(toChild[0]); close(fromChild[1])
-    guard result == 0 else { close(toChild[1]); close(fromChild[0]); return nil }
-    return SpawnedApplication(pid: pid, cdp: CDPClient(inputFD: toChild[1], outputFD: fromChild[0]))
+private func writeShimBundle(launchArguments: [String]) -> Bool {
+    let bundle = shimBundlePath()
+    let contentsDirectory = bundle + "/Contents"
+    let macosDirectory = contentsDirectory + "/MacOS"
+    try? FileManager.default.removeItem(atPath: bundle)
+    guard (try? FileManager.default.createDirectory(atPath: macosDirectory, withIntermediateDirectories: true)) != nil else { return false }
+    let plist = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.codex-limit-banner-hider.debugshim</string>
+    <key>CFBundleName</key><string>CodexDebugShim</string>
+    <key>CFBundleExecutable</key><string>launcher</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>1.0</string>
+    <key>LSUIElement</key><true/>
+    </dict></plist>
+    """
+    guard (try? plist.write(toFile: contentsDirectory + "/Info.plist", atomically: true, encoding: .utf8)) != nil else { return false }
+    let arguments = (["--remote-debugging-port=0", managedFlag] + launchArguments)
+        .map { $0.contains("'") ? "''" : $0 }
+        .map { "'\($0)'" }
+        .joined(separator: " ")
+    let launcher = """
+    #!/bin/zsh
+    export __CFBundleIdentifier='\(bundleID)'
+    exec '\(executablePath)' \(arguments)
+    """
+    do {
+        try launcher.write(toFile: macosDirectory + "/launcher", atomically: true, encoding: .utf8)
+    } catch { return false }
+    do {
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: macosDirectory + "/launcher")
+    } catch { return false }
+    return true
 }
 
-private func spawnOrdinaryApplication() -> pid_t? {
-    var actions: posix_spawn_file_actions_t?
-    posix_spawn_file_actions_init(&actions)
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
-    let args = [executablePath]
-    let argv = args.map { strdup($0) } + [nil]
-    defer {
-        argv.forEach { if let pointer = $0 { free(pointer) } }
-        posix_spawn_file_actions_destroy(&actions)
+private func launchManagedApplication(profileDirectory: String, launchArguments: [String] = []) -> ManagedApplication? {
+    let launchTime = Date()
+    guard writeShimBundle(launchArguments: launchArguments) else { return nil }
+    let openResult = shell("/usr/bin/open", ["-n", shimBundlePath()])
+    guard openResult.0 == 0 else { return nil }
+
+    let portFilePath = profileDirectory + "/DevToolsActivePort"
+    let deadline = launchTime.addingTimeInterval(30)
+    while Date() < deadline {
+        if let content = try? String(contentsOfFile: portFilePath, encoding: .utf8) {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: portFilePath)
+            let modified = (attributes?[.modificationDate] as? Date) ?? .distantPast
+            let lines = content.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            if modified >= launchTime.addingTimeInterval(-2), lines.count >= 2,
+               let port = UInt16(lines[0]), port != 0,
+               let url = URL(string: "ws://127.0.0.1:\(port)\(lines[1])") {
+                let cdp = CDPClient(url: url)
+                if cdp.command("Browser.getVersion", timeout: 5) != nil {
+                    // The exec'd binary replaces the launcher script process,
+                    // so it keeps the LS-launched PID. Identify it by the
+                    // managed flag in its command line.
+                    var foundPID: pid_t?
+                    let pidDeadline = Date().addingTimeInterval(15)
+                    while foundPID == nil && Date() < pidDeadline {
+                        foundPID = findApplicationProcesses().first { process in
+                            process.startedAt >= launchTime.timeIntervalSince1970 - 1 &&
+                            (readCommandLine(pid: process.pid)?.contains(managedFlag) ?? false)
+                        }?.pid
+                        if foundPID == nil { usleep(300_000) }
+                    }
+                    guard let pid = foundPID else {
+                        cdp.close()
+                        return nil
+                    }
+                    return ManagedApplication(pid: pid, cdp: cdp)
+                }
+                cdp.close()
+            }
+        }
+        usleep(500_000)
     }
-    guard let environment = NSGetEnviron().pointee else { return nil }
-    var pid: pid_t = 0
-    return posix_spawn(&pid, executablePath, &actions, nil, argv, environment) == 0 ? pid : nil
+    return nil
+}
+
+private func launchOrdinaryApplication() -> pid_t? {
+    let before = Set(findApplicationProcesses().map(\.pid))
+    let openResult = shell("/usr/bin/open", ["-n", appPath])
+    guard openResult.0 == 0 else { return nil }
+    let deadline = Date().addingTimeInterval(15)
+    while Date() < deadline {
+        if let fresh = findApplicationProcesses().first(where: { !before.contains($0.pid) }) {
+            return fresh.pid
+        }
+        usleep(300_000)
+    }
+    return nil
 }
 
 private func preserveOrdinaryApplication(reason: String) {
     var runtime = readJSON(runtimePath)
-    guard let pid = spawnOrdinaryApplication() else {
+    guard let pid = launchOrdinaryApplication() else {
         runtime.removeValue(forKey: "managedPID")
         runtime.removeValue(forKey: "managedStartedAt")
         runtime.removeValue(forKey: "managedProcessStartedAt")
@@ -344,7 +427,7 @@ private func inject(into cdp: CDPClient, source: String, sessions: inout [String
     }
     guard let sessionID else { return ["decision": "attach-failed"] }
 
-    let identityExpression = "JSON.stringify({ok:location.href==='app://-/index.html'&&document.title==='ChatGPT'&&!!document.querySelector('#root')&&[...document.querySelectorAll('#root *')].some(e=>e.classList.contains('electron:h-toolbar')),readyState:document.readyState})"
+    let identityExpression = "JSON.stringify({ok:location.href==='app://-/index.html'&&document.title==='ChatGPT'&&!!document.querySelector('#root [class~=\"electron:h-toolbar\"]'),readyState:document.readyState})"
     guard let identityResponse = cdp.command("Runtime.evaluate", params: ["expression": identityExpression, "returnByValue": true], sessionID: sessionID),
           let identityResult = identityResponse["result"] as? [String: Any],
           let remote = identityResult["result"] as? [String: Any],
@@ -378,7 +461,27 @@ private func inject(into cdp: CDPClient, source: String, sessions: inout [String
     return status
 }
 
-private func superviseManagedApplication(_ app: SpawnedApplication, sourcePath: String = injectionPath, terminateAfterTest: Bool = false) {
+// Decisions that mean the page is injected and verified. Once reached, the
+// controller detaches from every CDP session and stays silent: no target
+// discovery events, no periodic Runtime.evaluate pokes into the renderer main
+// thread, no status churn. The injected script is self-sufficient from here on.
+private let injectionCompleteDecisions: Set<String> = ["absent", "hidden", "ambiguous", "structure-rejected"]
+
+private func terminateAndWait(_ pid: pid_t) {
+    kill(pid, SIGTERM)
+    let deadline = Date().addingTimeInterval(4)
+    while Date() < deadline {
+        var status: Int32 = 0
+        let waited = waitpid(pid, &status, WNOHANG)
+        if waited == pid { return }                                          // child exited and reaped
+        if waited == 0, isAlive(pid) { usleep(100_000); continue }           // child still running
+        if waited < 0, errno == ECHILD, isAlive(pid) { usleep(100_000); continue } // not our child, alive
+        if waited < 0, errno == EINTR { usleep(100_000); continue }
+        return
+    }
+}
+
+private func superviseManagedApplication(_ app: ManagedApplication, sourcePath: String = injectionPath, terminateAfterTest: Bool = false) {
     let source: String
     do { source = try String(contentsOfFile: sourcePath, encoding: .utf8) }
     catch {
@@ -410,28 +513,62 @@ private func superviseManagedApplication(_ app: SpawnedApplication, sourcePath: 
     _ = app.cdp.command("Target.setDiscoverTargets", params: ["discover": true])
     var sessions: [String: String] = [:]
     var injectedSessions: Set<String> = []
+    var detached = false
     let testDeadline = terminateAfterTest ? Date().addingTimeInterval(45) : nil
     while childIsRunning(app.pid) {
-        let injectionStatus = inject(into: app.cdp, source: source, sessions: &sessions, injectedSessions: &injectedSessions)
-        var fields = injectionStatus
-        if let injectionVersion = fields.removeValue(forKey: "version") {
-            fields["injectionVersion"] = injectionVersion
+        if !detached {
+            let injectionStatus = inject(into: app.cdp, source: source, sessions: &sessions, injectedSessions: &injectedSessions)
+            var fields = injectionStatus
+            if let injectionVersion = fields.removeValue(forKey: "version") {
+                fields["injectionVersion"] = injectionVersion
+            }
+            fields["mode"] = "managed"
+            fields["codexPID"] = Int(app.pid)
+            fields["codexVersion"] = appVersion()
+            fields["signatureValid"] = true
+            updateStatus(fields)
+            let decision = injectionStatus["decision"] as? String ?? "unknown"
+
+            if injectionCompleteDecisions.contains(decision) {
+                // Ephemeral CDP handoff: stop target discovery, detach every
+                // session, and disconnect. A persistent attached DevTools
+                // client measurably changes renderer behavior (timer
+                // throttling, back/forward cache, network stack), which showed
+                // up as input and session-switching lag in live use. The
+                // injected script is self-sufficient from here on.
+                _ = app.cdp.command("Target.setDiscoverTargets", params: ["discover": false])
+                for (_, sessionID) in sessions {
+                    _ = app.cdp.command("Target.detachFromTarget", params: ["sessionId": sessionID])
+                }
+                sessions.removeAll()
+                injectedSessions.removeAll()
+                app.cdp.close()
+                detached = true
+                updateStatus([
+                    "mode": "managed",
+                    "codexPID": Int(app.pid),
+                    "decision": decision,
+                    "supervision": "detached",
+                    "signatureValid": true,
+                ])
+            }
+
+            if terminateAfterTest,
+               !["starting", "target-waiting", "identity-waiting"].contains(decision) {
+                terminateAndWait(app.pid)
+                break
+            }
+            if let testDeadline, Date() >= testDeadline {
+                updateStatus(["mode": "degraded", "decision": "self-test-timeout", "codexPID": Int(app.pid)])
+                terminateAndWait(app.pid)
+                break
+            }
+            let needsFastRetry = ["starting", "target-waiting", "identity-waiting", "attach-failed", "status-unavailable"].contains(decision)
+            sleep(needsFastRetry ? 1 : 10)
+        } else {
+            // Quiet supervision: no CDP traffic at all. Only wait for exit.
+            sleep(10)
         }
-        fields["mode"] = "managed"
-        fields["codexPID"] = Int(app.pid)
-        fields["codexVersion"] = appVersion()
-        fields["signatureValid"] = true
-        updateStatus(fields)
-        if terminateAfterTest,
-           let decision = injectionStatus["decision"] as? String,
-           !["starting", "target-waiting", "identity-waiting"].contains(decision) {
-            kill(app.pid, SIGTERM)
-        }
-        if let testDeadline, Date() >= testDeadline {
-            updateStatus(["mode": "degraded", "decision": "self-test-timeout", "codexPID": Int(app.pid)])
-            kill(app.pid, SIGTERM)
-        }
-        sleep(3)
     }
     runtime = readJSON(runtimePath)
     runtime.removeValue(forKey: "managedPID")
@@ -574,21 +711,18 @@ private func supervise() {
         }
 
         updateStatus(["mode": "handoff", "codexPID": Int(refreshed.pid), "decision": "restarting-new-process", "signatureValid": true])
-        kill(refreshed.pid, SIGTERM)
-        let deadline = Date().addingTimeInterval(4)
-        while isAlive(refreshed.pid) && Date() < deadline { usleep(100_000) }
+        terminateAndWait(refreshed.pid)
         guard !isAlive(refreshed.pid) else {
             preserve(refreshed, decision: "graceful-handoff-failed-process-preserved", runtime: &runtime)
             updateStatus(["mode": "deferred", "codexPID": Int(refreshed.pid), "decision": "graceful-handoff-failed-process-preserved", "signatureValid": true])
             continue
         }
         usleep(300_000)
-        guard let spawned = spawnManagedApplication() else {
-            preserveOrdinaryApplication(reason: "Could not start signed Codex with private debugging pipe")
+        guard let managed = launchManagedApplication(profileDirectory: codexProfileDirectory) else {
+            preserveOrdinaryApplication(reason: "Could not launch signed Codex with a local debugging port")
             continue
         }
-        superviseManagedApplication(spawned)
-    }
+        superviseManagedApplication(managed)    }
 }
 
 private func printStatus(json: Bool) {
@@ -622,18 +756,19 @@ case "self-test-application-validation":
     let data = try! JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
     if !validation.0 { exit(1) }
-case "self-test-pipe":
+case "self-test-port":
     let testProfile = FileManager.default.temporaryDirectory.appendingPathComponent("codex-limit-banner-hider-test.\(UUID().uuidString)").path
     try? FileManager.default.createDirectory(atPath: testProfile, withIntermediateDirectories: true)
     defer {
         try? FileManager.default.removeItem(atPath: testProfile)
         try? FileManager.default.removeItem(atPath: stateDirectory)
     }
-    guard arguments.count == 2, let spawned = spawnManagedApplication(extraArguments: ["--user-data-dir=\(testProfile)", "--no-first-run"]) else { exit(1) }
-    superviseManagedApplication(spawned, sourcePath: arguments[1], terminateAfterTest: true)
+    guard arguments.count == 2,
+          let managed = launchManagedApplication(profileDirectory: testProfile, launchArguments: ["--user-data-dir=\(testProfile)", "--no-first-run"]) else { exit(1) }
+    superviseManagedApplication(managed, sourcePath: arguments[1], terminateAfterTest: true)
     printStatus(json: true)
 case "status": printStatus(json: arguments.contains("--json"))
 default:
-    fputs("Usage: codex-limit-banner-hider-controller [supervise|status [--json]|self-test-application-validation]\n", stderr)
+    fputs("Usage: codex-limit-banner-hider-controller [supervise|status [--json]|self-test-port <injected.js>|self-test-processes|self-test-application-validation]\n", stderr)
     exit(64)
 }

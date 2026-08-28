@@ -19,12 +19,12 @@ if [[ -x /Applications/ChatGPT.app/Contents/MacOS/ChatGPT ]]; then
   "$TEST_TMP/codex-limit-banner-hider-controller" self-test-application-validation >"$TEST_TMP/application-validation.json"
   /usr/bin/grep -q '"valid" : true' "$TEST_TMP/application-validation.json"
 
-  print "Running isolated private-pipe controller test..."
-  "$TEST_TMP/codex-limit-banner-hider-controller" self-test-pipe "$ROOT_DIR/src/injected.js" >"$TEST_TMP/pipe-test.json"
-  /usr/bin/grep -q '"mode" : "managed"' "$TEST_TMP/pipe-test.json"
-  /usr/bin/grep -Eq '"decision" : "(absent|hidden)"' "$TEST_TMP/pipe-test.json"
+  print "Running isolated local-port controller test..."
+  "$TEST_TMP/codex-limit-banner-hider-controller" self-test-port "$ROOT_DIR/src/injected.js" >"$TEST_TMP/port-test.json"
+  /usr/bin/grep -q '"mode" : "managed"' "$TEST_TMP/port-test.json"
+  /usr/bin/grep -Eq '"decision" : "(absent|hidden)"' "$TEST_TMP/port-test.json"
 
-  print "Running ten isolated DOM matching cases..."
+  print "Running isolated DOM matching, discovery, and observer performance cases..."
   /usr/bin/env node "$ROOT_DIR/test/injection-cdp-test.mjs"
 else
   print "Codex is not installed; skipping local CDP integration tests."

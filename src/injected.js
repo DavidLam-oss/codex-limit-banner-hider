@@ -1,12 +1,16 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.1.1";
+  const VERSION = "1.2.2";
   const MARKER = "data-codex-limit-banner-hider";
   const STYLE_ID = "codex-limit-banner-hider-style";
   const STATUS_KEY = "__codexLimitBannerHiderStatus";
   const INSTANCE_KEY = "__codexLimitBannerHiderInstance";
   const TEST_MODE_KEY = "__CODEX_LIMIT_BANNER_HIDER_TEST_MODE__";
+  const RECONCILE_DELAY_MS = 200;
+  const DISCOVERY_INTERVAL_MS = 1_000;
+  const STARTUP_RETRY_MS = 250;
+  const STARTUP_TIMEOUT_MS = 10_000;
 
   const BLOCKING_TITLES = new Set([
     "You’re out of Codex and Work usage",
@@ -58,9 +62,7 @@
     if (location.href !== "app://-/index.html" || document.title !== "ChatGPT") return false;
     const root = document.querySelector("#root");
     if (!root) return false;
-    return [...root.querySelectorAll("*")].some(element =>
-      element.classList.contains("electron:h-toolbar"),
-    );
+    return root.querySelector('[class~="electron:h-toolbar"]') !== null;
   }
 
   function titleMatches(aside) {
@@ -111,19 +113,117 @@
     };
   }
 
-  function scan() {
-    if (!isMainWindow()) {
-      setStatus({ decision: "identity-mismatch", exactTitleCount: 0, qualifiedCount: 0, hiddenCount: 0 });
-      return;
-    }
+  const knownAsides = new Set();
+  // Asides currently passing the structural prefilter (the banner class
+  // triple). Only these carry a MutationObserver, so text and node churn in
+  // unrelated live asides (sidebars, composers) never enters the callback.
+  const shapedAsides = new Set();
+  const metrics = {
+    fullScanCount: 0,
+    discoveryPollCount: 0,
+    reconcileCount: 0,
+    observerCallbackCount: 0,
+    asideCallbackCount: 0,
+    relevantMutationBatchCount: 0,
+  };
+  let asideObserver = null;
+  let discoveryTimer = null;
+  let reconcileTimer = null;
+  let startupTimer = null;
 
-    ensureStyle();
-    const root = document.querySelector("#root") || document.body;
-    const asides = [...root.querySelectorAll("aside")];
+  function isBannerShaped(aside) {
+    return aside.classList.contains("w-full") &&
+        aside.classList.contains("rounded-2xl") &&
+        aside.classList.contains("bg-surface");
+  }
+
+  const OBSERVE_OPTIONS = {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["class"],
+  };
+
+  // Brings the observation state of one aside in line with its shape.
+  // Returns true when the observation state changed.
+  function syncObservation(aside) {
+    if (asideObserver === null) return false;
+    const shaped = isBannerShaped(aside);
+    const wasShaped = shapedAsides.has(aside);
+    if (shaped === wasShaped) return false;
+    if (shaped) {
+      shapedAsides.add(aside);
+      asideObserver.observe(aside, OBSERVE_OPTIONS);
+      return true;
+    }
+    // MutationObserver cannot unobserve a single node; rebuild instead.
+    shapedAsides.delete(aside);
+    asideObserver.disconnect();
+    for (const remaining of shapedAsides) {
+      asideObserver.observe(remaining, OBSERVE_OPTIONS);
+    }
+    return true;
+  }
+
+  function trackAside(aside) {
+    if (aside instanceof HTMLElement && aside.tagName === "ASIDE" && aside.isConnected) {
+      knownAsides.add(aside);
+      syncObservation(aside);
+      return true;
+    }
+    return false;
+  }
+
+  function trackClosestAside(node) {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!element) return false;
+    const aside = element.matches("aside") ? element : element.closest("aside");
+    if (!aside) return false;
+    trackAside(aside);
+    return true;
+  }
+
+  function trackContainedAsides(node) {
+    if (!(node instanceof Element)) return false;
+    let found = false;
+    if (node.matches("aside")) {
+      found = true;
+      trackAside(node);
+    }
+    const firstNestedAside = node.querySelector("aside");
+    if (!firstNestedAside) return found;
+    found = true;
+    trackAside(firstNestedAside);
+    for (const aside of node.querySelectorAll("aside")) trackAside(aside);
+    return found;
+  }
+
+  function updateTrackedAsides(record) {
+    let relevant = trackClosestAside(record.target);
+    if (record.type !== "childList") return relevant;
+    for (const node of record.addedNodes) {
+      if (trackContainedAsides(node)) relevant = true;
+    }
+    for (const node of record.removedNodes) {
+      if (node instanceof Element && (node.matches("aside") || node.querySelector("aside"))) relevant = true;
+    }
+    return relevant;
+  }
+
+  function reconcile() {
+    metrics.reconcileCount += 1;
+    for (const aside of knownAsides) {
+      if (!aside.isConnected) {
+        knownAsides.delete(aside);
+        shapedAsides.delete(aside);
+      }
+    }
+    const asides = [...knownAsides];
     const exactTitleCount = asides.filter(aside => titleMatches(aside) !== null).length;
     const qualified = asides.filter(matchesBlockingBanner);
 
-    for (const marked of root.querySelectorAll(`aside[${MARKER}]`)) {
+    for (const marked of asides.filter(aside => aside.hasAttribute(MARKER))) {
       if (qualified.length !== 1 || marked !== qualified[0]) marked.removeAttribute(MARKER);
     }
 
@@ -141,8 +241,84 @@
       decision,
       exactTitleCount,
       qualifiedCount: qualified.length,
-      hiddenCount: root.querySelectorAll(`aside[${MARKER}="hidden"]`).length,
+      hiddenCount: asides.filter(aside => aside.getAttribute(MARKER) === "hidden").length,
     });
+  }
+
+  function scan() {
+    metrics.fullScanCount += 1;
+    const root = document.querySelector("#root") || document.body;
+    if (!root) {
+      setStatus({ decision: "identity-waiting", exactTitleCount: 0, qualifiedCount: 0, hiddenCount: 0 });
+      return;
+    }
+    for (const aside of root.querySelectorAll("aside")) trackAside(aside);
+    reconcile();
+  }
+
+  function discoverNewAsides() {
+    metrics.discoveryPollCount += 1;
+    const root = document.querySelector("#root") || document.body;
+    if (!root) return false;
+
+    let changed = false;
+    for (const aside of knownAsides) {
+      if (!aside.isConnected) {
+        knownAsides.delete(aside);
+        shapedAsides.delete(aside);
+        changed = true;
+      }
+    }
+    for (const aside of root.querySelectorAll("aside")) {
+      const wasShaped = shapedAsides.has(aside);
+      const isNew = !knownAsides.has(aside);
+      trackAside(aside);
+      if (isNew || shapedAsides.has(aside) !== wasShaped) changed = true;
+    }
+    return changed;
+  }
+
+  function scheduleDiscovery() {
+    if (discoveryTimer !== null) return;
+    discoveryTimer = setTimeout(() => {
+      discoveryTimer = null;
+      // A hidden window cannot show a banner; skip the query entirely.
+      if (!document.hidden) {
+        if (discoverNewAsides()) reconcile();
+      }
+      scheduleDiscovery();
+    }, DISCOVERY_INTERVAL_MS);
+  }
+
+  function scheduleReconcile() {
+    if (reconcileTimer !== null) return;
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null;
+      reconcile();
+    }, RECONCILE_DELAY_MS);
+  }
+
+  function handleAsideMutations(records) {
+    metrics.observerCallbackCount += 1;
+    metrics.asideCallbackCount += 1;
+    let relevant = false;
+    for (const record of records) {
+      if (updateTrackedAsides(record)) relevant = true;
+    }
+    if (!relevant) return;
+    metrics.relevantMutationBatchCount += 1;
+    scheduleReconcile();
+  }
+
+  function destroy() {
+    asideObserver?.disconnect();
+    shapedAsides.clear();
+    if (discoveryTimer !== null) clearTimeout(discoveryTimer);
+    if (reconcileTimer !== null) clearTimeout(reconcileTimer);
+    if (startupTimer !== null) clearTimeout(startupTimer);
+    discoveryTimer = null;
+    reconcileTimer = null;
+    startupTimer = null;
   }
 
   const existing = globalThis[INSTANCE_KEY];
@@ -150,29 +326,31 @@
     existing.scan();
     return;
   }
+  if (typeof existing?.destroy === "function") {
+    existing.destroy();
+  } else {
+    existing?.observer?.disconnect();
+  }
 
-  let scheduled = false;
-  const scheduleScan = () => {
-    if (scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      scan();
-    });
-  };
+  const instance = { version: VERSION, scan, matchesBlockingBanner, observer: null, asideObserver: null, metrics, destroy };
+  globalThis[INSTANCE_KEY] = instance;
+  const startupDeadline = Date.now() + STARTUP_TIMEOUT_MS;
 
   const start = () => {
     if (!isMainWindow()) {
-      setStatus({ decision: "identity-mismatch", exactTitleCount: 0, qualifiedCount: 0, hiddenCount: 0 });
+      setStatus({ decision: "identity-waiting", exactTitleCount: 0, qualifiedCount: 0, hiddenCount: 0 });
+      if (Date.now() < startupDeadline) startupTimer = setTimeout(start, STARTUP_RETRY_MS);
       return;
     }
-    const observer = new MutationObserver(scheduleScan);
-    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    globalThis[INSTANCE_KEY].observer = observer;
+    startupTimer = null;
+    ensureStyle();
+    asideObserver = new MutationObserver(handleAsideMutations);
+    instance.observer = asideObserver;
+    instance.asideObserver = asideObserver;
     scan();
+    scheduleDiscovery();
   };
 
-  globalThis[INSTANCE_KEY] = { version: VERSION, scan, matchesBlockingBanner, observer: null };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start, { once: true });
   } else {

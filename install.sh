@@ -80,7 +80,7 @@ payload = {
     "ProgramArguments": [controller, "supervise"],
     "RunAtLoad": True,
     "KeepAlive": True,
-    "ProcessType": "Background",
+    "ProcessType": "Adaptive",
     "StandardOutPath": stdout,
     "StandardErrorPath": stderr,
 }
