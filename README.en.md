@@ -1,5 +1,3 @@
-# Codex Limit Banner Hider
-
 ![Codex Limit Banner Hider banner](assets/codex-limit-hider-en.webp)
 
 [简体中文](README.md)
