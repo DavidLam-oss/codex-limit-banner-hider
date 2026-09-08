@@ -1,5 +1,7 @@
 # Codex Limit Banner Hider
 
+![Codex Limit Banner Hider 中文横幅](assets/codex-limit-hider-cn.webp)
+
 [English](README.en.md)
 
 一个适用于 macOS Codex 桌面版的非官方、用户级界面定制：当通用 Codex / Work usage 已耗尽时，精确隐藏整块 blocking 横幅及其布局占位。
